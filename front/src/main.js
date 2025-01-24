@@ -71,8 +71,7 @@ function lipSync(model_name, value) {
   let model = window.live2d_models[model_name]
   if (model && model.internalModel.motionManager.lipSyncIds.length > 0) {
     var lip_id = model.internalModel.motionManager.lipSyncIds[0]
-    model.internalModel.coreModel.setParameterValueById(lip_id, 0)
-    model.internalModel.coreModel.setParameterValueById(lip_id, value)
+    model.internalModel.coreModel.setParameterValueById(lip_id, value, 0.8)
   }
 }
 
@@ -87,12 +86,17 @@ function getAverageVolume(array) {
   }
 
   average = values / length;
-  return Math.min(average, 100.0) / 100.0;
+  return Math.min(average, 50.0) / 50.0;
 }
 
 var frequencyData;
 
 var speaker = ''
+
+function closeMouth() {
+  lipSync(speaker, 0)
+  setTimeout(updateVolume, 90)
+}
 
 function updateVolume() {
   if (analyser == undefined) {
@@ -102,9 +106,11 @@ function updateVolume() {
   analyser.getByteFrequencyData(frequencyData);
 
   const volume = getAverageVolume(frequencyData);
-  lipSync(speaker, volume)
+  if (volume > 0.4) {
+    lipSync(speaker, volume)
+  }
 
-  requestAnimationFrame(updateVolume);
+  setTimeout(closeMouth, 90)
 }
 
 async function playWav(wavData) {
@@ -126,6 +132,7 @@ async function playWav(wavData) {
   let p = new Promise((resolve, _reject) => {
     bufferSource.onended = () => {
       analyser = undefined
+      lipSync(speaker, 0)
       resolve()
     }
   })
