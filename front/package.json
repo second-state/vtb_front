@@ -12,6 +12,7 @@
     "vite": "^6.0.5"
   },
   "dependencies": {
-    "oh-my-live2d": "^0.19.3"
+    "pixi-live2d-display": "^0.4.0",
+    "pixi.js": "6.5"
   }
 }

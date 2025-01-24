@@ -24,13 +24,31 @@ impl ServiceState {
         }
     }
 
+    pub async fn update_title(&self, title: String) -> anyhow::Result<()> {
+        let mut ws_pool = self.ws_pool.lock().await;
+        let mut error_ids = vec![];
+        for (id, ws) in ws_pool.iter_mut() {
+            let msg = MessageEvent::UpdateTitle {
+                title: title.clone(),
+            };
+            if let Err(e) = ws.send(msg.into()).await {
+                log::error!("send message to {} live2d error: {:?}", id, e);
+                error_ids.push(id.clone());
+            }
+        }
+        for id in error_ids {
+            ws_pool.remove(&id);
+        }
+
+        Ok(())
+    }
+
     pub async fn random_say(
         &self,
         vtb_name: String,
         text: Option<String>,
         motion: Option<String>,
         wav_voice: Option<Bytes>,
-        hold_sec: u32,
     ) -> anyhow::Result<()> {
         let mut ws_pool = self.ws_pool.lock().await;
         let ws = ws_pool
@@ -39,21 +57,22 @@ impl ServiceState {
             .ok_or_else(|| anyhow::anyhow!("ws_pool is empty"))?;
 
         if text.is_some() || motion.is_some() {
-            let msg = MessageEvent {
+            let msg = MessageEvent::Speech(SpeechEvent {
                 vtb_name,
                 motion: motion.unwrap_or_default(),
-                say: text.unwrap_or_default(),
-                hold_sec,
-            };
+                message: text.unwrap_or_default(),
+            });
             ws.send(msg.into())
                 .await
                 .map_err(|e| anyhow::anyhow!("send message to live2d error: {:?}", e))?;
+
+            if let Some(data) = wav_voice {
+                ws.send(Message::Binary(data))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("send wav to live2d error: {:?}", e))?;
+            }
         }
-        if let Some(data) = wav_voice {
-            ws.send(Message::Binary(data))
-                .await
-                .map_err(|e| anyhow::anyhow!("send wav to live2d error: {:?}", e))?;
-        }
+
         Ok(())
     }
 
@@ -64,7 +83,6 @@ impl ServiceState {
         text: Option<String>,
         motion: Option<String>,
         wav_voice: Option<Vec<u8>>,
-        hold_sec: u32,
     ) -> anyhow::Result<()> {
         let mut ws_pool = self.ws_pool.lock().await;
         let ws = ws_pool
@@ -72,20 +90,19 @@ impl ServiceState {
             .ok_or_else(|| anyhow::anyhow!("ID {id} Not found"))?;
 
         if text.is_some() || motion.is_some() {
-            let msg = MessageEvent {
+            let msg = MessageEvent::Speech(SpeechEvent {
                 vtb_name,
                 motion: motion.unwrap_or_default(),
-                say: text.unwrap_or_default(),
-                hold_sec,
-            };
+                message: text.unwrap_or_default(),
+            });
             ws.send(msg.into())
                 .await
                 .map_err(|e| anyhow::anyhow!("send message to live2d {id} error: {:?}", e))?;
-        }
-        if let Some(data) = wav_voice {
-            ws.send(Message::Binary(Bytes::from_owner(data)))
-                .await
-                .map_err(|e| anyhow::anyhow!("send wav to live2d {id} error: {:?}", e))?;
+            if let Some(data) = wav_voice {
+                ws.send(Message::Binary(Bytes::from_owner(data)))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("send wav to live2d {id} error: {:?}", e))?;
+            }
         }
         Ok(())
     }
@@ -120,9 +137,9 @@ fn api_router() -> Router<ServiceState> {
     Router::new()
         .route("/say/{id}", post(send_msg))
         .route("/say_form", post(send_msg_form))
+        .route("/update_title", post(update_title))
 }
 
-#[cfg(debug_assertions)]
 async fn test_page() -> axum::response::Html<&'static str> {
     axum::response::Html(
         r#"
@@ -215,7 +232,7 @@ async fn send_msg_form(
         ..
     } = msg.unwrap();
 
-    match state.random_say(vtb_name, text, motion, voice, 5).await {
+    match state.random_say(vtb_name, text, motion, voice).await {
         Ok(_) => Ok(format!("ok")),
         Err(e) => {
             log::error!("random_say error: {:?}", e);
@@ -238,7 +255,22 @@ async fn send_msg(
         ..
     } = msg;
 
-    match state.say(&id, vtb_name, text, motion, None, 5).await {
+    match state.say(&id, vtb_name, text, motion, None).await {
+        Ok(_) => Ok(format!("ok")),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UpdateTitleRequest {
+    title: String,
+}
+
+async fn update_title(
+    State(state): State<ServiceState>,
+    Json(title): Json<UpdateTitleRequest>,
+) -> Result<String, StatusCode> {
+    match state.update_title(title.title).await {
         Ok(_) => Ok(format!("ok")),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -254,11 +286,17 @@ async fn websocket_handler(
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct MessageEvent {
+#[serde(tag = "type")]
+pub enum MessageEvent {
+    UpdateTitle { title: String },
+    Speech(SpeechEvent),
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct SpeechEvent {
     pub vtb_name: String,
     pub motion: String,
-    pub say: String,
-    pub hold_sec: u32,
+    pub message: String,
 }
 
 impl Into<axum::extract::ws::Message> for MessageEvent {

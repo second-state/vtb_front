@@ -6,11 +6,58 @@
   <link rel="icon" type="image/svg+xml" href="/vite.svg" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <script type="module" src="/models.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/dylanNew/live2d/webgl/Live2D/lib/live2d.min.js"></script>
+  <script src="/live2dcubismcore.min.js"></script>
   <title>Live2d VTB App</title>
+
+  <style>
+    .mask_title {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 30%;
+      height: 10%;
+      background-color: rgba(0, 0, 0, 0.3);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      color: white;
+      font-size: 24px;
+    }
+
+    .mask {
+      position: absolute;
+      top: 60%;
+      left: 10%;
+      width: 80%;
+      height: 40%;
+      background-color: rgba(0, 0, 0, 0.3);
+      overflow-y: hidden;
+      display: flex;
+      justify-content: flex-start;
+      align-items: flex-start;
+      white-space: normal;
+      word-break: break-all;
+      overflow-wrap: break-word;
+      color: white;
+      font-size: 24px;
+    }
+
+    body {
+      background-image: url('backgroud-image.png');
+      background-repeat: no-repeat;
+      background-attachment: fixed;
+      background-size: cover;
+    }
+  </style>
 </head>
 
 <body>
-  <div id="app"></div>
+  <div id="app">
+    <canvas id=canvas></canvas>
+    <div id="title" class="mask_title">这是一个标题</div>
+    <div id="messages" class="mask">这是一个蒙版</div>
+  </div>
   <script type="module" src="/src/main.js"></script>
 </body>
 

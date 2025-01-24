@@ -1,32 +1,18 @@
 window.live2dModels = {
-    'default': {
-        sayHello: false,
-        models: [
-            {
-                path: 'https://cdn.jsdelivr.net/gh/Eikanya/Live2d-model/Live2D/Senko_Normals/senko.model3.json',
-                // path: '/live2d_models/senko.model3.json',
-                scale: 0.2,
-                position: [0, 120],
-                stageStyle: {
-                    left: '600px',
-                    height: 700,
-                    width: 600
-                }
-            }
-        ]
+    'white_cat': {
+        model: {
+            path: "/models/tororo_hijiki/tororo/runtime/tororo.model3.json",
+            scale: 0.35,
+            position: [700, 0],
+            parameter: {}
+        }
     },
     'black_cat': {
-        sayHello: false,
-        models: [
-            {
-                path: "https://model.oml2d.com/cat-black/model.json",
-                scale: 0.2,
-                position: [0, 150],
-                stageStyle: {
-                    height: 700,
-                    width: 600
-                }
-            }
-        ]
+        model: {
+            path: "/models/tororo_hijiki/hijiki/runtime/hijiki.model3.json",
+            scale: 0.35,
+            position: [0, 0],
+            parameter: {}
+        }
     }
 }

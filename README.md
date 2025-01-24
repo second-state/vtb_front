@@ -1,3 +1,11 @@
+# Download demo model
+```bash
+cd front/public
+mkdir models && cd models
+wget https://cubism.live2d.com/sample-data/bin/tororohijiki/tororo_hijiki.zip
+unzip tororo_hijiki.zip
+```
+
 # Dev Start
 ```bash
 cd front

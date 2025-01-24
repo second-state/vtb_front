@@ -1,4 +1,5 @@
-import { loadOml2d } from 'oh-my-live2d';
+import { Live2DModel } from 'pixi-live2d-display';
+import * as PIXI from 'pixi.js';
 
 let url = new URL(window.location.href);
 let actor = url.searchParams.get('actor') || 'default';
@@ -6,23 +7,8 @@ console.log(`actor: ${actor}`);
 
 const live2dModels = window.live2dModels;
 
-var oml2dObjs = {}
-window.oml2dObjs = oml2dObjs;
+window.live2d_models = {};
 
-function load_models(actor) {
-  var model = live2dModels[actor]
-  model.tips = {
-    messageLine: 10
-  }
-  var oml2dObj = loadOml2d(model);
-  oml2dObjs[actor] = oml2dObj
-}
-
-function clear_all_tips() {
-  for (var key in oml2dObjs) {
-    oml2dObjs[key].clearTips()
-  }
-}
 
 var audioContext;
 
@@ -31,14 +17,14 @@ var async_queue = {
   resolve: undefined
 }
 
-function put_item(data) {
+function putItem(data) {
   async_queue.data.push(data)
   if (async_queue.resolve) {
     async_queue.resolve()
   }
 }
 
-async function get_item() {
+async function getItem() {
   if (async_queue.data.length === 0) {
     let r = new Promise((resolve, _) => {
       async_queue.resolve = resolve
@@ -49,73 +35,110 @@ async function get_item() {
 }
 
 
-async function wav_loop() {
+async function wavLoop() {
   while (true) {
-    let ws_data = await get_item()
+    let ws_data = await getItem()
     if (ws_data instanceof Blob) {
       try {
         await playWav(ws_data)
-        clear_all_tips()
       } catch (e) {
         console.error(e)
       }
     } else {
       let data = JSON.parse(ws_data)
-      if (data.motion) {
-        showMotion(data.motion)
-      }
-      if (data.say) {
-        say(data.vtb_name, data.say, 600 * 1000)
+      switch (data['type']) {
+        case 'UpdateTitle':
+          document.getElementById('title').innerText = data['title']
+          break
+        case 'Speech':
+          say(data['vtb_name'], data['message'])
+          if (data['motion'] !== '') {
+            showMotion(data['vtb_name'], data['motion'])
+          }
+          break
       }
     }
   }
 }
 
-wav_loop()
+wavLoop()
 
 var ws = undefined;
+
+var analyser = undefined;
+
+function lipSync(model_name, value) {
+  let model = window.live2d_models[model_name]
+  if (model && model.internalModel.motionManager.lipSyncIds.length > 0) {
+    var lip_id = model.internalModel.motionManager.lipSyncIds[0]
+    model.internalModel.coreModel.setParameterValueById(lip_id, 0)
+    model.internalModel.coreModel.setParameterValueById(lip_id, value)
+  }
+}
+
+function getAverageVolume(array) {
+  let values = 0;
+  let average;
+
+  const length = array.length;
+
+  for (let i = 0; i < length; i++) {
+    values += array[i];
+  }
+
+  average = values / length;
+  return Math.min(average, 100.0) / 100.0;
+}
+
+var frequencyData;
+
+var speaker = ''
+
+function updateVolume() {
+  if (analyser == undefined) {
+    return
+  }
+
+  analyser.getByteFrequencyData(frequencyData);
+
+  const volume = getAverageVolume(frequencyData);
+  lipSync(speaker, volume)
+
+  requestAnimationFrame(updateVolume);
+}
 
 async function playWav(wavData) {
   if (!audioContext) {
     audioContext = new (window.AudioContext || window.webkitAudioContext)()
   }
+  analyser = audioContext.createAnalyser()
+  analyser.fftSize = 256;
+  frequencyData = new Uint8Array(analyser.frequencyBinCount);
+
   let bufferData = await wavData.arrayBuffer()
   let audioBuffer = await audioContext.decodeAudioData(bufferData)
   const bufferSource = audioContext.createBufferSource()
   bufferSource.buffer = audioBuffer
-  bufferSource.connect(audioContext.destination)
+  bufferSource.connect(analyser)
+  analyser.connect(audioContext.destination)
   bufferSource.start(0)
+  updateVolume()
   let p = new Promise((resolve, _reject) => {
     bufferSource.onended = () => {
+      analyser = undefined
       resolve()
     }
   })
   await p
 }
 
-function display(text) {
-  var div = document.getElementById("app");
-
-  div.style.fontSize = "16px"; // 设置字体大小
-  div.style.color = "white";     // 设置字体颜色
-  var textNode = document.createTextNode(text);
-  div.appendChild(textNode);
-  div.appendChild(document.createElement("br"));
-}
-
-function clear_display() {
-  var div = document.getElementById("app");
-  div.innerHTML = "";
-}
-
 var connecting = false;
 
-function connect_backend() {
+function connectBackend() {
   if (connecting) {
     return
   }
   connecting = true
-  display("Connecting to backend...")
   let ws_url = `/ws/${actor}`
 
   try {
@@ -128,51 +151,78 @@ function connect_backend() {
       newUrl += ':' + location.port;
     }
     newUrl += ws_url;
-    display(newUrl)
     ws = new WebSocket(newUrl)
   }
   // ws = new WebSocket(ws_url)
   ws.onmessage = (event) => {
-    put_item(event.data)
+    putItem(event.data)
   }
   ws.onerror = (event) => {
     connecting = false
     console.error(event)
-    display(`Failed to connect to backend ${event}`)
   }
   ws.onclose = () => {
     connecting = false
     clear_display()
     say("default", "Connecting to backend...")
     setTimeout(() => {
-      connect_backend()
+      connectBackend()
     }, 5000)
   }
   ws.onopen = () => {
     connecting = false
-    clear_display()
-    display("Connected to backend")
-  }
-
-}
-
-function say(vtb_name, message, duartion = 3000) {
-  try {
-    oml2dObjs[vtb_name].tipsMessage(message, duartion)
-  } catch (e) {
-    console.error(e)
   }
 }
 
-function showMotion(vtb_name, motionGroup) {
-  try {
-    oml2dObjs[vtb_name].models.playMotion(motionGroup)
-  } catch (e) {
-    console.error(e)
+const messsages = []
+
+function say(vtb_name, message) {
+  speaker = vtb_name
+  messsages.push({ vtb_name, message })
+  if (messsages.length > 5) {
+    messsages.shift()
+  }
+  let div = document.getElementById('messages');
+  let p = '';
+  for (var m in messsages) {
+    p += `${messsages[m].vtb_name}> ${messsages[m].message}\n`;
+  }
+
+  div.innerText = p;
+  div.scrollTop = div.scrollHeight;
+}
+
+function showMotion(vtb_name, motion) {
+  let model = window.live2d_models[vtb_name];
+  if (model) {
+    model.internalModel.motionManager.startRandomMotion(motion, 3);
   }
 }
 
-load_models('default')
-load_models('black_cat')
+connectBackend()
+// internalModel.motionManager.lipSyncIds
+window.PIXI = PIXI;
 
-connect_backend()
+(async function load_all_models() {
+  const app = new PIXI.Application({
+    view: document.getElementById("canvas"),
+    autoStart: true,
+    resizeTo: window,
+    backgroundAlpha: 0.5,
+  });
+
+  for (var key in live2dModels) {
+    var model_config = live2dModels[key].model;
+    var model = await Live2DModel.from(model_config.path);
+    app.stage.addChild(model);
+    model.scale.set(model_config.scale);
+
+    model.x = model_config.position[0];
+    model.y = model_config.position[1];
+    for (var p in model_config.parameter) {
+      model.internalModel.coreModel.setParameterValueById(p, model_config.parameter[p]);
+    }
+    window.live2d_models[key] = model;
+  }
+
+})();
