@@ -9,6 +9,9 @@ const live2dModels = window.live2dModels;
 
 window.live2d_models = {};
 
+var ws = undefined;
+
+var analyser = undefined;
 
 var audioContext;
 
@@ -18,7 +21,15 @@ var async_queue = {
 }
 
 function putItem(data) {
-  async_queue.data.push(data)
+  if (data instanceof Blob) {
+    async_queue.data.push(data)
+  } else {
+    let data_json = JSON.parse(data)
+    async_queue.data.push(data_json)
+    if (data_json['type'] == 'Speech' && data_json['voice']) {
+      return
+    }
+  }
   if (async_queue.resolve) {
     async_queue.resolve()
   }
@@ -26,6 +37,12 @@ function putItem(data) {
 
 async function getItem() {
   if (async_queue.data.length === 0) {
+    if (ws !== undefined && ws.readyState !== WebSocket.CLOSED) {
+      try {
+        ws.send('done')
+      } catch (e) { }
+    }
+
     let r = new Promise((resolve, _) => {
       async_queue.resolve = resolve
     })
@@ -45,7 +62,7 @@ async function wavLoop() {
         console.error(e)
       }
     } else {
-      let data = JSON.parse(ws_data)
+      let data = ws_data
       switch (data['type']) {
         case 'UpdateTitle':
           document.getElementById('title').innerText = data['title']
@@ -63,9 +80,6 @@ async function wavLoop() {
 
 wavLoop()
 
-var ws = undefined;
-
-var analyser = undefined;
 
 function lipSync(model_name, value) {
   let model = window.live2d_models[model_name]
@@ -170,7 +184,6 @@ function connectBackend() {
   }
   ws.onclose = () => {
     connecting = false
-    clear_display()
     say("default", "Connecting to backend...")
     setTimeout(() => {
       connectBackend()
@@ -185,15 +198,16 @@ const messsages = []
 
 function say(vtb_name, message) {
   speaker = vtb_name
-  messsages.push({ vtb_name, message })
-  if (messsages.length > 5) {
-    messsages.shift()
-  }
+  // messsages.push({ vtb_name, message })
+  // if (messsages.length > 5) {
+  //   messsages.shift()
+  // }
   let div = document.getElementById('messages');
-  let p = '';
-  for (var m in messsages) {
-    p += `${messsages[m].vtb_name}> ${messsages[m].message}\n`;
-  }
+  // let p = '';
+  // for (var m in messsages) {
+  //   p += `${messsages[m].vtb_name}> ${messsages[m].message}\n`;
+  // }
+  let p = `${vtb_name}> ${message}`;
 
   div.innerText = p;
   div.scrollTop = div.scrollHeight;

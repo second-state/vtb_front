@@ -12,9 +12,16 @@ use axum::{
     Json, Router,
 };
 
+#[allow(unused)]
+#[derive(Debug)]
+pub struct WebSocketEntry {
+    id: String,
+    tx: tokio::sync::mpsc::Sender<WsEvent>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ServiceState {
-    ws_pool: Arc<tokio::sync::Mutex<HashMap<String, WebSocket>>>,
+    ws_pool: Arc<tokio::sync::Mutex<HashMap<String, WebSocketEntry>>>,
 }
 
 impl ServiceState {
@@ -31,7 +38,7 @@ impl ServiceState {
             let msg = MessageEvent::UpdateTitle {
                 title: title.clone(),
             };
-            if let Err(e) = ws.send(msg.into()).await {
+            if let Err(e) = ws.tx.send(WsEvent::Message(msg)).await {
                 log::error!("send message to {} live2d error: {:?}", id, e);
                 error_ids.push(id.clone());
             }
@@ -61,13 +68,16 @@ impl ServiceState {
                 vtb_name,
                 motion: motion.unwrap_or_default(),
                 message: text.unwrap_or_default(),
+                voice: wav_voice.is_some(),
             });
-            ws.send(msg.into())
+            ws.tx
+                .send(WsEvent::Message(msg))
                 .await
                 .map_err(|e| anyhow::anyhow!("send message to live2d error: {:?}", e))?;
 
             if let Some(data) = wav_voice {
-                ws.send(Message::Binary(data))
+                ws.tx
+                    .send(WsEvent::Message(MessageEvent::Voice(data)))
                     .await
                     .map_err(|e| anyhow::anyhow!("send wav to live2d error: {:?}", e))?;
             }
@@ -82,7 +92,7 @@ impl ServiceState {
         vtb_name: String,
         text: Option<String>,
         motion: Option<String>,
-        wav_voice: Option<Vec<u8>>,
+        wav_voice: Option<Bytes>,
     ) -> anyhow::Result<()> {
         let mut ws_pool = self.ws_pool.lock().await;
         let ws = ws_pool
@@ -94,14 +104,18 @@ impl ServiceState {
                 vtb_name,
                 motion: motion.unwrap_or_default(),
                 message: text.unwrap_or_default(),
+                voice: wav_voice.is_some(),
             });
-            ws.send(msg.into())
+            ws.tx
+                .send(WsEvent::Message(msg))
                 .await
-                .map_err(|e| anyhow::anyhow!("send message to live2d {id} error: {:?}", e))?;
+                .map_err(|e| anyhow::anyhow!("send message to live2d error: {:?}", e))?;
+
             if let Some(data) = wav_voice {
-                ws.send(Message::Binary(Bytes::from_owner(data)))
+                ws.tx
+                    .send(WsEvent::Message(MessageEvent::Voice(data)))
                     .await
-                    .map_err(|e| anyhow::anyhow!("send wav to live2d {id} error: {:?}", e))?;
+                    .map_err(|e| anyhow::anyhow!("send wav to live2d error: {:?}", e))?;
             }
         }
         Ok(())
@@ -138,6 +152,7 @@ fn api_router() -> Router<ServiceState> {
         .route("/say/{id}", post(send_msg))
         .route("/say_form", post(send_msg_form))
         .route("/update_title", post(update_title))
+        .route("/register_callback/{id}", post(register_callback))
 }
 
 async fn test_page() -> axum::response::Html<&'static str> {
@@ -205,7 +220,10 @@ async fn parse_from_multipart(mut multipart: Multipart) -> anyhow::Result<SendMs
                 req.motion = Some(field.text().await?);
             }
             "voice" => {
-                req.voice = Some(field.bytes().await?);
+                let data = field.bytes().await?;
+                if !data.is_empty() {
+                    req.voice = Some(data);
+                }
             }
             _ => {}
         }
@@ -276,6 +294,30 @@ async fn update_title(
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct RegisterCallbackRequest {
+    callback_url: String,
+}
+
+async fn register_callback(
+    Path(id): Path<String>,
+    State(state): State<ServiceState>,
+    Json(callback_url): Json<RegisterCallbackRequest>,
+) -> Result<String, StatusCode> {
+    let ws_pool = state.ws_pool.lock().await;
+    if let Some(ws) = ws_pool.get(&id) {
+        ws.tx
+            .send(WsEvent::AddCallback(vec![callback_url.callback_url]))
+            .await
+            .map_err(|e| {
+                log::error!("send message to live2d error: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    Ok(format!("ok"))
+}
+
 async fn websocket_handler(
     Path(id): Path<String>,
     ws: WebSocketUpgrade,
@@ -285,11 +327,21 @@ async fn websocket_handler(
     ws.on_upgrade(|socket| websocket(id, socket, state))
 }
 
+#[derive(Debug, Clone)]
+pub enum WsEvent {
+    Message(MessageEvent),
+    AddCallback(Vec<String>),
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type")]
 pub enum MessageEvent {
-    UpdateTitle { title: String },
+    UpdateTitle {
+        title: String,
+    },
     Speech(SpeechEvent),
+    #[serde(skip)]
+    Voice(Bytes),
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -297,6 +349,7 @@ pub struct SpeechEvent {
     pub vtb_name: String,
     pub motion: String,
     pub message: String,
+    pub voice: bool,
 }
 
 impl Into<axum::extract::ws::Message> for MessageEvent {
@@ -307,6 +360,89 @@ impl Into<axum::extract::ws::Message> for MessageEvent {
 
 async fn websocket(id: String, stream: WebSocket, state: ServiceState) {
     let mut pool = state.ws_pool.lock().await;
-    pool.insert(id, stream);
+
+    let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+    let ws_entry = WebSocketEntry { id: id.clone(), tx };
+    pool.insert(id.clone(), ws_entry);
+
+    // pool.insert(id, stream);
     log::info!("ws pool {:?}", pool.keys());
+    tokio::spawn(ws_loop(id, stream, rx));
+}
+
+enum SelectResult {
+    Event(WsEvent),
+    Ws(Message),
+}
+
+async fn select_ws(
+    ws: &mut WebSocket,
+    rx: &mut tokio::sync::mpsc::Receiver<WsEvent>,
+) -> anyhow::Result<SelectResult> {
+    tokio::select! {
+        msg = ws.recv() => {
+            match msg {
+                Some(Ok(msg)) => Ok(SelectResult::Ws(msg)),
+                Some(Err(e)) => Err(anyhow::anyhow!("ws recv error: {:?}", e)),
+                None => Err(anyhow::anyhow!("ws closed")),
+            }
+        }
+        msg = rx.recv() => {
+            match msg {
+                Some(msg) => Ok(SelectResult::Event(msg)),
+                None => Err(anyhow::anyhow!("rx recv close")),
+            }
+        }
+    }
+}
+
+async fn callback(callback_urls: Vec<String>) {
+    for url in callback_urls {
+        tokio::spawn(async move {
+            let client = reqwest::get(&url).await;
+            if let Err(e) = client {
+                log::warn!("callback {url} error: {:?}", e);
+            }
+        });
+    }
+}
+
+async fn ws_loop(
+    id: String,
+    mut ws: WebSocket,
+    mut rx: tokio::sync::mpsc::Receiver<WsEvent>,
+) -> anyhow::Result<()> {
+    log::info!("ws_loop {} start", id);
+    let mut callback_urls: Option<Vec<String>> = None;
+    loop {
+        let r = select_ws(&mut ws, &mut rx).await?;
+        match r {
+            SelectResult::Ws(Message::Text(_)) | SelectResult::Ws(Message::Binary(_)) => {
+                log::info!("{id} done");
+                if let Some(callback_urls) = callback_urls.take() {
+                    tokio::spawn(callback(callback_urls));
+                }
+            }
+
+            SelectResult::Ws(Message::Close(_)) => {
+                Err(anyhow::anyhow!("ws closed"))?;
+            }
+            SelectResult::Ws(Message::Ping(_)) | SelectResult::Ws(Message::Pong(_)) => {}
+            SelectResult::Event(WsEvent::Message(MessageEvent::Voice(data))) => {
+                ws.send(Message::Binary(data)).await?;
+            }
+            SelectResult::Event(WsEvent::Message(ws_msg)) => {
+                ws.send(ws_msg.into()).await?;
+            }
+            SelectResult::Event(WsEvent::AddCallback(urls)) => match &mut callback_urls {
+                Some(callback_urls) => {
+                    callback_urls.extend(urls);
+                }
+                None => {
+                    callback_urls = Some(urls);
+                }
+            },
+        }
+    }
 }
