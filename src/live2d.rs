@@ -21,67 +21,25 @@ pub struct WebSocketEntry {
 
 #[derive(Clone, Debug)]
 pub struct ServiceState {
-    ws_pool: Arc<tokio::sync::Mutex<HashMap<String, WebSocketEntry>>>,
+    ws_pool: Arc<tokio::sync::RwLock<HashMap<String, WebSocketEntry>>>,
 }
 
 impl ServiceState {
     pub fn new() -> Self {
         Self {
-            ws_pool: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            ws_pool: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
     }
 
-    pub async fn update_title(&self, title: String) -> anyhow::Result<()> {
-        let mut ws_pool = self.ws_pool.lock().await;
-        let mut error_ids = vec![];
-        for (id, ws) in ws_pool.iter_mut() {
-            let msg = MessageEvent::UpdateTitle {
-                title: title.clone(),
-            };
-            if let Err(e) = ws.tx.send(WsEvent::Message(msg)).await {
-                log::error!("send message to {} live2d error: {:?}", id, e);
-                error_ids.push(id.clone());
-            }
-        }
-        for id in error_ids {
-            ws_pool.remove(&id);
-        }
-
-        Ok(())
-    }
-
-    pub async fn random_say(
-        &self,
-        vtb_name: String,
-        text: Option<String>,
-        motion: Option<String>,
-        wav_voice: Option<Bytes>,
-    ) -> anyhow::Result<()> {
-        let mut ws_pool = self.ws_pool.lock().await;
+    pub async fn update_title(&self, id: &str, title: String) -> anyhow::Result<()> {
+        let ws_pool = self.ws_pool.read().await;
         let ws = ws_pool
-            .values_mut()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("ws_pool is empty"))?;
-
-        if text.is_some() || motion.is_some() {
-            let msg = MessageEvent::Speech(SpeechEvent {
-                vtb_name,
-                motion: motion.unwrap_or_default(),
-                message: text.unwrap_or_default(),
-                voice: wav_voice.is_some(),
-            });
-            ws.tx
-                .send(WsEvent::Message(msg))
-                .await
-                .map_err(|e| anyhow::anyhow!("send message to live2d error: {:?}", e))?;
-
-            if let Some(data) = wav_voice {
-                ws.tx
-                    .send(WsEvent::Message(MessageEvent::Voice(data)))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("send wav to live2d error: {:?}", e))?;
-            }
-        }
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("ID {id} Not found"))?;
+        ws.tx
+            .send(WsEvent::UpdateTitle(title))
+            .await
+            .map_err(|e| anyhow::anyhow!("send message to live2d error: {:?}", e))?;
 
         Ok(())
     }
@@ -93,30 +51,48 @@ impl ServiceState {
         text: Option<String>,
         motion: Option<String>,
         wav_voice: Option<Bytes>,
+        sync: bool,
     ) -> anyhow::Result<()> {
-        let mut ws_pool = self.ws_pool.lock().await;
-        let ws = ws_pool
-            .get_mut(id)
-            .ok_or_else(|| anyhow::anyhow!("ID {id} Not found"))?;
+        let ws_pool = self.ws_pool.read().await;
+        let ws = if id.is_empty() {
+            ws_pool
+                .values()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("ws_pool is empty"))?
+        } else {
+            ws_pool
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("ID {id} Not found"))?
+        };
 
         if text.is_some() || motion.is_some() {
-            let msg = MessageEvent::Speech(SpeechEvent {
-                vtb_name,
-                motion: motion.unwrap_or_default(),
-                message: text.unwrap_or_default(),
-                voice: wav_voice.is_some(),
-            });
-            ws.tx
-                .send(WsEvent::Message(msg))
-                .await
-                .map_err(|e| anyhow::anyhow!("send message to live2d error: {:?}", e))?;
-
-            if let Some(data) = wav_voice {
+            if sync {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let ws_event = WsEvent::SyncMessage {
+                    vtb_name,
+                    motion: motion.unwrap_or_default(),
+                    message: text.unwrap_or_default(),
+                    voice: wav_voice,
+                    waker: tx,
+                };
                 ws.tx
-                    .send(WsEvent::Message(MessageEvent::Voice(data)))
+                    .send(ws_event)
                     .await
-                    .map_err(|e| anyhow::anyhow!("send wav to live2d error: {:?}", e))?;
-            }
+                    .map_err(|e| anyhow::anyhow!("send message to live2d error: {:?}", e))?;
+                rx.await
+                    .map_err(|_| anyhow::anyhow!("live2d connect closed"))?;
+            } else {
+                let ws_event = WsEvent::Message {
+                    vtb_name,
+                    motion: motion.unwrap_or_default(),
+                    message: text.unwrap_or_default(),
+                    voice: wav_voice,
+                };
+                ws.tx
+                    .send(ws_event)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("send message to live2d error: {:?}", e))?;
+            };
         }
         Ok(())
     }
@@ -151,8 +127,9 @@ fn api_router() -> Router<ServiceState> {
     Router::new()
         .route("/say/{id}", post(send_msg))
         .route("/say_form", post(send_msg_form))
-        .route("/update_title", post(update_title))
-        .route("/register_callback/{id}", post(register_callback))
+        .route("/sync/say/{id}", post(send_msg_sync))
+        .route("/sync/say_form", post(send_msg_form_sync))
+        .route("/update_title/{id}", post(update_title))
 }
 
 async fn test_page() -> axum::response::Html<&'static str> {
@@ -162,7 +139,37 @@ async fn test_page() -> axum::response::Html<&'static str> {
         <html>
             <head></head>
             <body>
+                <label>Async:</label>
                 <form action="/api/say_form" method="post" enctype="multipart/form-data">
+                    <label>
+                        id:
+                        <input type="text" name="id">
+                    </label>
+                    <label>
+                        vtb_name:
+                        <input type="text" name="vtb_name">
+                    </label>
+                    <label>
+                        text:
+                        <input type="text" name="text">
+                    </label>
+                    <label>
+                        motion:
+                        <input type="text" name="motion">
+                    </label>
+                    <label>
+                        voice:
+                        <input type="file" name="voice">
+                    </label>
+
+                    <input type="submit" value="Submit">
+                </form>
+                <label>Sync:</label>
+                <form action="/api/sync/say_form" method="post" enctype="multipart/form-data">
+                    <label>
+                        id:
+                        <input type="text" name="id">
+                    </label>
                     <label>
                         vtb_name:
                         <input type="text" name="vtb_name">
@@ -190,6 +197,7 @@ async fn test_page() -> axum::response::Html<&'static str> {
 
 #[derive(Debug, serde::Deserialize)]
 struct SendMsgRequest {
+    id: String,
     vtb_name: String,
     #[serde(default)]
     text: Option<String>,
@@ -201,7 +209,8 @@ struct SendMsgRequest {
 
 async fn parse_from_multipart(mut multipart: Multipart) -> anyhow::Result<SendMsgRequest> {
     let mut req = SendMsgRequest {
-        vtb_name: "".to_string(),
+        id: String::new(),
+        vtb_name: String::new(),
         text: None,
         motion: None,
         voice: None,
@@ -210,6 +219,9 @@ async fn parse_from_multipart(mut multipart: Multipart) -> anyhow::Result<SendMs
     while let Some(field) = multipart.next_field().await? {
         let field_name = field.name().unwrap_or_default();
         match field_name {
+            "id" => {
+                req.id = field.text().await?;
+            }
             "vtb_name" => {
                 req.vtb_name = field.text().await?;
             }
@@ -243,6 +255,7 @@ async fn send_msg_form(
     }
 
     let SendMsgRequest {
+        id,
         vtb_name,
         text,
         motion,
@@ -250,10 +263,13 @@ async fn send_msg_form(
         ..
     } = msg.unwrap();
 
-    match state.random_say(vtb_name, text, motion, voice).await {
+    match state
+        .say(id.as_str(), vtb_name, text, motion, voice, false)
+        .await
+    {
         Ok(_) => Ok(format!("ok")),
         Err(e) => {
-            log::error!("random_say error: {:?}", e);
+            log::error!("say error: {:?}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -273,7 +289,58 @@ async fn send_msg(
         ..
     } = msg;
 
-    match state.say(&id, vtb_name, text, motion, None).await {
+    match state.say(&id, vtb_name, text, motion, None, false).await {
+        Ok(_) => Ok(format!("ok")),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn send_msg_form_sync(
+    State(state): State<ServiceState>,
+    multipart: Multipart,
+) -> Result<String, StatusCode> {
+    let msg = parse_from_multipart(multipart).await;
+    if let Err(e) = msg {
+        log::error!("parse_from_multipart error: {:?}", e);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let SendMsgRequest {
+        id,
+        vtb_name,
+        text,
+        motion,
+        voice,
+        ..
+    } = msg.unwrap();
+
+    match state
+        .say(id.as_str(), vtb_name, text, motion, voice, true)
+        .await
+    {
+        Ok(_) => Ok(format!("ok")),
+        Err(e) => {
+            log::error!("say error: {:?}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn send_msg_sync(
+    Path(id): Path<String>,
+    State(state): State<ServiceState>,
+    Json(msg): Json<SendMsgRequest>,
+) -> Result<String, StatusCode> {
+    log::info!("send_msg id: {}, msg: {:?}", id, msg);
+
+    let SendMsgRequest {
+        vtb_name,
+        text,
+        motion,
+        ..
+    } = msg;
+
+    match state.say(&id, vtb_name, text, motion, None, true).await {
         Ok(_) => Ok(format!("ok")),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -285,37 +352,14 @@ struct UpdateTitleRequest {
 }
 
 async fn update_title(
+    Path(id): Path<String>,
     State(state): State<ServiceState>,
     Json(title): Json<UpdateTitleRequest>,
 ) -> Result<String, StatusCode> {
-    match state.update_title(title.title).await {
+    match state.update_title(&id, title.title).await {
         Ok(_) => Ok(format!("ok")),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct RegisterCallbackRequest {
-    callback_url: String,
-}
-
-async fn register_callback(
-    Path(id): Path<String>,
-    State(state): State<ServiceState>,
-    Json(callback_url): Json<RegisterCallbackRequest>,
-) -> Result<String, StatusCode> {
-    let ws_pool = state.ws_pool.lock().await;
-    if let Some(ws) = ws_pool.get(&id) {
-        ws.tx
-            .send(WsEvent::AddCallback(vec![callback_url.callback_url]))
-            .await
-            .map_err(|e| {
-                log::error!("send message to live2d error: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-    }
-
-    Ok(format!("ok"))
 }
 
 async fn websocket_handler(
@@ -327,21 +371,29 @@ async fn websocket_handler(
     ws.on_upgrade(|socket| websocket(id, socket, state))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum WsEvent {
-    Message(MessageEvent),
-    AddCallback(Vec<String>),
+    Message {
+        vtb_name: String,
+        motion: String,
+        message: String,
+        voice: Option<Bytes>,
+    },
+    SyncMessage {
+        vtb_name: String,
+        motion: String,
+        message: String,
+        voice: Option<Bytes>,
+        waker: tokio::sync::oneshot::Sender<()>,
+    },
+    UpdateTitle(String),
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type")]
 pub enum MessageEvent {
-    UpdateTitle {
-        title: String,
-    },
+    UpdateTitle { title: String },
     Speech(SpeechEvent),
-    #[serde(skip)]
-    Voice(Bytes),
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -350,6 +402,7 @@ pub struct SpeechEvent {
     pub motion: String,
     pub message: String,
     pub voice: bool,
+    pub waker: Option<usize>,
 }
 
 impl Into<axum::extract::ws::Message> for MessageEvent {
@@ -359,7 +412,7 @@ impl Into<axum::extract::ws::Message> for MessageEvent {
 }
 
 async fn websocket(id: String, stream: WebSocket, state: ServiceState) {
-    let mut pool = state.ws_pool.lock().await;
+    let mut pool = state.ws_pool.write().await;
 
     let (tx, rx) = tokio::sync::mpsc::channel(10);
 
@@ -397,52 +450,83 @@ async fn select_ws(
     }
 }
 
-async fn callback(callback_urls: Vec<String>) {
-    for url in callback_urls {
-        tokio::spawn(async move {
-            let client = reqwest::get(&url).await;
-            if let Err(e) = client {
-                log::warn!("callback {url} error: {:?}", e);
-            }
-        });
-    }
-}
-
 async fn ws_loop(
     id: String,
     mut ws: WebSocket,
     mut rx: tokio::sync::mpsc::Receiver<WsEvent>,
 ) -> anyhow::Result<()> {
     log::info!("ws_loop {} start", id);
-    let mut callback_urls: Option<Vec<String>> = None;
+    let mut wakers: slab::Slab<tokio::sync::oneshot::Sender<()>> = slab::Slab::new();
+
     loop {
         let r = select_ws(&mut ws, &mut rx).await?;
         match r {
-            SelectResult::Ws(Message::Text(_)) | SelectResult::Ws(Message::Binary(_)) => {
-                log::info!("{id} done");
-                if let Some(callback_urls) = callback_urls.take() {
-                    tokio::spawn(callback(callback_urls));
+            SelectResult::Ws(Message::Text(wake_id)) => {
+                if let Ok(wake_id) = wake_id.parse::<usize>() {
+                    log::info!("{id}:{wake_id} done");
+                    if let Some(tx) = wakers.try_remove(wake_id) {
+                        let _ = tx.send(());
+                    }
                 }
+            }
+            SelectResult::Ws(Message::Binary(_)) => {
+                log::warn!("binary message not support");
             }
 
             SelectResult::Ws(Message::Close(_)) => {
                 Err(anyhow::anyhow!("ws closed"))?;
             }
             SelectResult::Ws(Message::Ping(_)) | SelectResult::Ws(Message::Pong(_)) => {}
-            SelectResult::Event(WsEvent::Message(MessageEvent::Voice(data))) => {
-                ws.send(Message::Binary(data)).await?;
+
+            SelectResult::Event(WsEvent::UpdateTitle(title)) => {
+                let event = MessageEvent::UpdateTitle { title };
+                ws.send(event.into()).await?;
             }
-            SelectResult::Event(WsEvent::Message(ws_msg)) => {
-                ws.send(ws_msg.into()).await?;
+
+            SelectResult::Event(WsEvent::Message {
+                vtb_name,
+                motion,
+                message,
+                voice,
+            }) => {
+                let event = MessageEvent::Speech(SpeechEvent {
+                    vtb_name,
+                    motion,
+                    message,
+                    voice: voice.is_some(),
+                    waker: None,
+                });
+                ws.send(event.into()).await?;
+                if let Some(data) = voice {
+                    ws.send(Message::Binary(data)).await?;
+                }
             }
-            SelectResult::Event(WsEvent::AddCallback(urls)) => match &mut callback_urls {
-                Some(callback_urls) => {
-                    callback_urls.extend(urls);
+            SelectResult::Event(WsEvent::SyncMessage {
+                vtb_name,
+                motion,
+                message,
+                voice,
+                waker,
+            }) => {
+                // let wake_id = wakers.insert(waker);
+                let entry = wakers.vacant_entry();
+                let key = entry.key();
+
+                let event = MessageEvent::Speech(SpeechEvent {
+                    vtb_name,
+                    motion,
+                    message,
+                    voice: voice.is_some(),
+                    waker: Some(key),
+                });
+                ws.send(event.into()).await?;
+                if let Some(data) = voice {
+                    ws.send(Message::Binary(data)).await?;
+                    entry.insert(waker);
+                } else {
+                    let _ = waker.send(());
                 }
-                None => {
-                    callback_urls = Some(urls);
-                }
-            },
+            }
         }
     }
 }

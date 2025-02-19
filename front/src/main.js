@@ -20,15 +20,16 @@ var async_queue = {
   resolve: undefined
 }
 
+function cleanQueue() {
+  async_queue.data = []
+}
+
 function putItem(data) {
   if (data instanceof Blob) {
     async_queue.data.push(data)
   } else {
     let data_json = JSON.parse(data)
     async_queue.data.push(data_json)
-    if (data_json['type'] == 'Speech' && data_json['voice']) {
-      return
-    }
   }
   if (async_queue.resolve) {
     async_queue.resolve()
@@ -37,12 +38,6 @@ function putItem(data) {
 
 async function getItem() {
   if (async_queue.data.length === 0) {
-    if (ws !== undefined && ws.readyState !== WebSocket.CLOSED) {
-      try {
-        ws.send('done')
-      } catch (e) { }
-    }
-
     let r = new Promise((resolve, _) => {
       async_queue.resolve = resolve
     })
@@ -53,11 +48,18 @@ async function getItem() {
 
 
 async function wavLoop() {
+  let waker = null;
   while (true) {
     let ws_data = await getItem()
     if (ws_data instanceof Blob) {
       try {
         await playWav(ws_data)
+        if (waker !== null) {
+          if (ws !== undefined && ws.readyState === WebSocket.OPEN) {
+            ws.send(waker + '')
+            waker = null
+          }
+        }
       } catch (e) {
         console.error(e)
       }
@@ -72,6 +74,7 @@ async function wavLoop() {
           if (data['motion'] !== '') {
             showMotion(data['vtb_name'], data['motion'])
           }
+          waker = data['waker']
           break
       }
     }
@@ -184,13 +187,15 @@ function connectBackend() {
   }
   ws.onclose = () => {
     connecting = false
-    say("default", "Connecting to backend...")
+    cleanQueue()
+    say("Log", "Connecting to backend...")
     setTimeout(() => {
       connectBackend()
     }, 5000)
   }
   ws.onopen = () => {
     connecting = false
+    say("Log", "Connect Ok")
   }
 }
 
