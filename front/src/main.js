@@ -243,8 +243,8 @@ window.PIXI = PIXI;
     app.stage.addChild(model);
     model.scale.set(model_config.scale);
 
-    model.x = model_config.position[0];
-    model.y = model_config.position[1];
+    model.x = (window.screen.width - app.stage.width + model_config.position[0]) / 2;
+    model.y = (window.screen.height - app.stage.height + model_config.position[1]) / 2;
     for (var p in model_config.parameter) {
       model.internalModel.coreModel.setParameterValueById(p, model_config.parameter[p]);
     }
