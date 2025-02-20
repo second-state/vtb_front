@@ -54,14 +54,14 @@ async function wavLoop() {
     if (ws_data instanceof Blob) {
       try {
         await playWav(ws_data)
-        if (waker !== null) {
-          if (ws !== undefined && ws.readyState === WebSocket.OPEN) {
-            ws.send(waker + '')
-            waker = null
-          }
-        }
       } catch (e) {
         console.error(e)
+      }
+      if (waker !== null) {
+        if (ws !== undefined && ws.readyState === WebSocket.OPEN) {
+          ws.send(waker + '')
+          waker = null
+        }
       }
     } else {
       let data = ws_data
