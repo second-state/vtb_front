@@ -1,11 +1,12 @@
-import { Live2DModel } from 'pixi-live2d-display';
+import { Live2DModel, logger } from 'pixi-live2d-display';
 import * as PIXI from 'pixi.js';
 
 let url = new URL(window.location.href);
 let actor = url.searchParams.get('actor') || 'default';
+let interaction = url.searchParams.get('interaction') || 'auto';
 console.log(`actor: ${actor}`);
 
-const live2dModels = window.live2dModels;
+const live2dScene = window.live2dScene;
 
 window.live2d_models = {};
 
@@ -29,7 +30,11 @@ function putItem(data) {
     async_queue.data.push(data)
   } else {
     let data_json = JSON.parse(data)
-    async_queue.data.push(data_json)
+    if (data['type'] == 'UpdateTitle') {
+      document.getElementById('title').innerText = data['title']
+    } else {
+      async_queue.data.push(data_json)
+    }
   }
   if (async_queue.resolve) {
     async_queue.resolve()
@@ -66,8 +71,8 @@ async function wavLoop() {
     } else {
       let data = ws_data
       switch (data['type']) {
-        case 'UpdateTitle':
-          document.getElementById('title').innerText = data['title']
+        case 'ChangeScene':
+          await load_all_models(data['index'])
           break
         case 'Speech':
           say(data['vtb_name'], data['message'])
@@ -226,22 +231,71 @@ function showMotion(vtb_name, motion) {
 }
 
 connectBackend()
+
+function draggable(model) {
+  model.buttonMode = true;
+  model.on("pointerdown", (e) => {
+    console.log("pointerdown");
+    model.dragging = true;
+    model._pointerX = e.data.global.x - model.x;
+    model._pointerY = e.data.global.y - model.y;
+  });
+  model.on("pointermove", (e) => {
+    if (model.dragging) {
+      model.position.x = e.data.global.x - model._pointerX;
+      model.position.y = e.data.global.y - model._pointerY;
+    }
+  });
+  model.on("pointerupoutside", () => {
+    model.dragging = false
+    console.log(`model position: ${model.x}, ${model.y}`);
+  });
+  model.on("pointerup", () => {
+    model.dragging = false
+    console.log(`model position: ${model.x}, ${model.y}`);
+  });
+}
+
 // internalModel.motionManager.lipSyncIds
 window.PIXI = PIXI;
 
-(async function load_all_models() {
-  const app = new PIXI.Application({
-    view: document.getElementById("canvas"),
-    autoStart: true,
-    resizeTo: window,
-    backgroundAlpha: 0.5,
-  });
+var current_index = -1;
+
+async function load_all_models(index) {
+  if (window.pixi_app == undefined) {
+    window.pixi_app = new PIXI.Application({
+      view: document.getElementById("canvas"),
+      autoStart: true,
+      resizeTo: window,
+      backgroundAlpha: 0.5,
+    });
+  }
+
+  if (live2dScene[index] == undefined) {
+    return
+  }
+
+  if (current_index == index) {
+    return
+  }
+
+  current_index = index;
+
+  let backgroud_image = live2dScene[index].background;
+  document.body.style.backgroundImage = `url(${backgroud_image})`;
+
+  let live2dModels = live2dScene[index].models;
+  let app = window.pixi_app;
+  app.stage.removeChildren()
+  window.live2d_models = {}
+
 
   for (var key in live2dModels) {
     var model_config = live2dModels[key].model;
     var model = await Live2DModel.from(model_config.path);
     app.stage.addChild(model);
     model.scale.set(model_config.scale);
+    model.eventMode = interaction;
 
     model.x = model_config.position[0];
     model.y = model_config.position[1];
@@ -249,6 +303,13 @@ window.PIXI = PIXI;
       model.internalModel.coreModel.setParameterValueById(p, model_config.parameter[p]);
     }
     window.live2d_models[key] = model;
+    draggable(model)
   }
 
-})();
+};
+
+window.load_all_models = load_all_models;
+
+document.addEventListener("DOMContentLoaded", async () => {
+  load_all_models(0)
+})

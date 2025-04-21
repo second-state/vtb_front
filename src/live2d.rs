@@ -44,6 +44,19 @@ impl ServiceState {
         Ok(())
     }
 
+    pub async fn change_scene(&self, id: &str, index: usize) -> anyhow::Result<()> {
+        let ws_pool = self.ws_pool.read().await;
+        let ws = ws_pool
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("ID {id} Not found"))?;
+        ws.tx
+            .send(WsEvent::ChangeScene(index))
+            .await
+            .map_err(|e| anyhow::anyhow!("send message to live2d error: {:?}", e))?;
+
+        Ok(())
+    }
+
     pub async fn say(
         &self,
         id: &str,
@@ -130,6 +143,7 @@ fn api_router() -> Router<ServiceState> {
         .route("/sync/say/{id}", post(send_msg_sync))
         .route("/sync/say_form", post(send_msg_form_sync))
         .route("/update_title/{id}", post(update_title))
+        .route("/change_scene/{id}", post(change_scene))
 }
 
 async fn test_page() -> axum::response::Html<&'static str> {
@@ -362,6 +376,22 @@ async fn update_title(
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct ChangeSceneRequest {
+    index: usize,
+}
+
+async fn change_scene(
+    Path(id): Path<String>,
+    State(state): State<ServiceState>,
+    Json(req): Json<ChangeSceneRequest>,
+) -> Result<String, StatusCode> {
+    match state.change_scene(&id, req.index).await {
+        Ok(_) => Ok(format!("ok")),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
 async fn websocket_handler(
     Path(id): Path<String>,
     ws: WebSocketUpgrade,
@@ -387,12 +417,14 @@ pub enum WsEvent {
         waker: tokio::sync::oneshot::Sender<()>,
     },
     UpdateTitle(String),
+    ChangeScene(usize),
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type")]
 pub enum MessageEvent {
     UpdateTitle { title: String },
+    ChangeScene { index: usize },
     Speech(SpeechEvent),
 }
 
@@ -480,6 +512,10 @@ async fn ws_loop(
 
             SelectResult::Event(WsEvent::UpdateTitle(title)) => {
                 let event = MessageEvent::UpdateTitle { title };
+                ws.send(event.into()).await?;
+            }
+            SelectResult::Event(WsEvent::ChangeScene(index)) => {
+                let event = MessageEvent::ChangeScene { index };
                 ws.send(event.into()).await?;
             }
 
