@@ -30,8 +30,8 @@ function putItem(data) {
     async_queue.data.push(data)
   } else {
     let data_json = JSON.parse(data)
-    if (data['type'] == 'UpdateTitle') {
-      document.getElementById('title').innerText = data['title']
+    if (data_json['type'] == 'UpdateTitle') {
+      document.getElementById('title').innerText = data_json['title']
     } else {
       async_queue.data.push(data_json)
     }
